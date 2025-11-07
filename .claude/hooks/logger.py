@@ -28,11 +28,13 @@ TIMESTAMP_CACHE_PATH = Path(TIMESTAMP_CACHE)
 AGENT_STATE_CACHE = LOG_PATH.parent / "agent_state.json"
 TOKEN_CACHE = LOG_PATH.parent / "session_tokens.json"
 MAX_LOG_SIZE_MB = 100
+MAX_CACHE_ENTRIES = 1000
 REDACT_SECRETS = True
 CLEAN_OUTPUT_TEXT = True
 TS_CONFIG = "compact"
 SID_CONFIG = "compact"
 MAX_LENGTH = 250
+ALWAYS_INCLUDE_FIELDS = {"token_in", "token_out"}
 
 FIELD_CONFIG = {
     "ts": True,
@@ -55,7 +57,7 @@ FIELD_CONFIG = {
     "cwd": True,
     "permission_mode": True,
     "reason": True,
-    "meta": False,
+    "meta": True,
     "duration_ms": True,
     "source": True,
     "token_in": True,
@@ -112,6 +114,18 @@ ERROR_KEYWORDS = {
 }
 
 # ============================================================================
+# CONFIGURATION VALIDATION
+# ============================================================================
+
+def _validate_config() -> None:
+    """Validate configuration values at startup"""
+    assert MAX_LENGTH > 0, "MAX_LENGTH must be positive"
+    assert MAX_LOG_SIZE_MB > 0, "MAX_LOG_SIZE_MB must be positive"
+    assert MAX_CACHE_ENTRIES > 0, "MAX_CACHE_ENTRIES must be positive"
+    assert TS_CONFIG in ("compact", "full"), f"Invalid TS_CONFIG: {TS_CONFIG}"
+    assert SID_CONFIG in ("compact", "full"), f"Invalid SID_CONFIG: {SID_CONFIG}"
+
+# ============================================================================
 # CACHE MANAGEMENT
 # ============================================================================
 
@@ -126,10 +140,37 @@ def _load_cache(cache_file: Path) -> Dict:
 
 def _save_cache(cache_file: Path, data: Dict) -> None:
     try:
-        ensure_log_dir()
+        _ensure_log_dir()
         with open(cache_file, "wb") as f:
             f.write(orjson.dumps(data))
     except OSError:
+        pass
+
+
+def _cleanup_cache_if_needed(cache_file: Path, max_entries: int = MAX_CACHE_ENTRIES) -> None:
+    """Remove oldest cache entries if exceeding threshold"""
+    try:
+        cache = _load_cache(cache_file)
+        if len(cache) <= max_entries:
+            return
+
+        # For timestamp cache: keep entries with most recent timestamps
+        # For other caches: keep most recently accessed entries
+        if cache_file == TIMESTAMP_CACHE_PATH:
+            # Extract timestamp entries (format: "session:tool" or "session:last_activity")
+            sorted_items = sorted(
+                cache.items(),
+                key=lambda x: x[1] if isinstance(x[1], (int, float)) else 0,
+                reverse=True
+            )
+        else:
+            # For agent_state and token cache, keep based on dict structure
+            sorted_items = list(cache.items())
+
+        # Keep only the most recent entries
+        trimmed_cache = dict(sorted_items[:max_entries])
+        _save_cache(cache_file, trimmed_cache)
+    except (OSError, TypeError, ValueError):
         pass
 
 # ============================================================================
@@ -150,7 +191,7 @@ def gzip_file(filepath: Path) -> bool:
             pass
         
         return True
-    except (OSError, IOError) as e:
+    except OSError as e:
         print(f"Warning: Failed to gzip {filepath}: {e}", file=sys.stderr)
         return False
 
@@ -173,8 +214,9 @@ def rotate_logs_if_needed(log_filepath: Path, max_size_mb: int = 100) -> bool:
         shutil.move(str(log_filepath), str(backup_path))
         
         gzip_file(backup_path)
-        
-        ensure_log_dir()
+
+
+        _ensure_log_dir()
         log_filepath.touch()
         
         size_mb = file_size_bytes / (1024 * 1024)
@@ -182,8 +224,8 @@ def rotate_logs_if_needed(log_filepath: Path, max_size_mb: int = 100) -> bool:
               file=sys.stderr)
         
         return True
-        
-    except (OSError, IOError) as e:
+
+    except OSError as e:
         print(f"Warning: Log rotation failed for {log_filepath}: {e}", file=sys.stderr)
         return False
 
@@ -191,13 +233,15 @@ def rotate_logs_if_needed(log_filepath: Path, max_size_mb: int = 100) -> bool:
 # UTILITY FUNCTIONS
 # ============================================================================
 
-def ensure_log_dir() -> None:
+def _ensure_log_dir() -> None:
+    """Ensure log directory exists (internal helper)"""
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
 def save_tool_start_time(session_id: str, tool_name: str, timestamp: str) -> None:
     cache = _load_cache(TIMESTAMP_CACHE_PATH)
     cache[f"{session_id}:{tool_name}"] = time.time()
+    _cleanup_cache_if_needed(TIMESTAMP_CACHE_PATH)
     _save_cache(TIMESTAMP_CACHE_PATH, cache)
 
 
@@ -228,6 +272,7 @@ def get_tool_duration_ms(session_id: str, tool_name: str, end_time: str) -> Opti
 def save_agent_state(session_id: str, subagent_name: str) -> None:
     cache = _load_cache(AGENT_STATE_CACHE)
     cache.setdefault(session_id, []).append(subagent_name)
+    _cleanup_cache_if_needed(AGENT_STATE_CACHE)
     _save_cache(AGENT_STATE_CACHE, cache)
 
 
@@ -256,6 +301,7 @@ def update_session_tokens(session_id: str, input_tokens: int, output_tokens: int
     cache[session_id]["output"] += output_tokens
     cache[session_id]["total"] = cache[session_id]["input"] + cache[session_id]["output"]
 
+    _cleanup_cache_if_needed(TOKEN_CACHE)
     _save_cache(TOKEN_CACHE, cache)
     return cache[session_id].copy()
 
@@ -263,6 +309,7 @@ def update_session_tokens(session_id: str, input_tokens: int, output_tokens: int
 def save_activity_timestamp(session_id: str) -> None:
     cache = _load_cache(TIMESTAMP_CACHE_PATH)
     cache[f"{session_id}:last_activity"] = time.time()
+    _cleanup_cache_if_needed(TIMESTAMP_CACHE_PATH)
     _save_cache(TIMESTAMP_CACHE_PATH, cache)
 
 
@@ -283,11 +330,12 @@ def get_activity_duration_ms(session_id: str) -> Optional[int]:
 
 
 def _ensure_text(value: Any) -> str:
+    """Convert any value to string representation"""
     if isinstance(value, (list, dict)):
         try:
             return orjson.dumps(value).decode("utf-8")
         except Exception:
-            return str(value)
+            pass  # Fallthrough to str()
     return str(value)
 
 
@@ -480,10 +528,9 @@ def classify_command(command: str) -> str:
 
 
 def filter_fields(log_entry: Dict[str, Any]) -> Dict[str, Any]:
-    TOKEN_FIELDS = {"token_in", "token_out"}
     return {
-        k: v for k, v in log_entry.items() 
-        if k in TOKEN_FIELDS or FIELD_CONFIG.get(k, True)
+        k: v for k, v in log_entry.items()
+        if k in ALWAYS_INCLUDE_FIELDS or FIELD_CONFIG.get(k, True)
     }
 
 
@@ -504,24 +551,20 @@ def format_session_id(session_id: str) -> str:
         return session_id
 
 
-def determine_actor(event_name: str, hook_input: Dict[str, Any], session_id: str) -> str:
-    if event_name == "UserPromptSubmit":
-        return "user"
+def determine_operator(event_name: str, hook_input: Dict[str, Any], session_id: str, level: str = "top") -> str:
+    """
+    Determine operator at given level.
 
-    if hook_input.get("background_task_id"):
-        return "background"
+    Args:
+        event_name: Name of the hook event
+        hook_input: Hook input data
+        session_id: Current session ID
+        level: "top" for high-level actor (user/main/subagent/background)
+               "detailed" for detailed agent type (user/main/agent-name/background)
 
-    if event_name == "PreToolUse":
-        tool_input = hook_input.get("tool_input", {})
-        if tool_input.get("run_in_background"):
-            return "background"
-        if hook_input.get("tool_name") == "Task":
-            return "main"
-
-    return "subagent" if get_current_agent(session_id) else "main"
-
-
-def determine_agent_type(event_name: str, hook_input: Dict[str, Any], session_id: str) -> str:
+    Returns:
+        Operator string based on level
+    """
     if event_name == "UserPromptSubmit":
         return "user"
 
@@ -534,16 +577,21 @@ def determine_agent_type(event_name: str, hook_input: Dict[str, Any], session_id
             return "background"
 
         if hook_input.get("tool_name") == "Task":
-            if subagent := tool_input.get("subagent_type"):
+            if level == "detailed" and (subagent := tool_input.get("subagent_type")):
                 save_agent_state(session_id, subagent)
             return "main"
 
-    elif event_name == "SubagentStop":
+    elif event_name == "SubagentStop" and level == "detailed":
         current = get_current_agent(session_id)
         clear_agent_state(session_id)
         return current or "agent"
 
-    return get_current_agent(session_id) or "main"
+    # Determine based on level
+    current_agent = get_current_agent(session_id)
+    if level == "top":
+        return "subagent" if current_agent else "main"
+    else:  # detailed
+        return current_agent or "main"
 
 
 def extract_event_data(hook_input: Dict[str, Any]) -> Dict[str, Any]:
@@ -554,8 +602,8 @@ def extract_event_data(hook_input: Dict[str, Any]) -> Dict[str, Any]:
     base = {
         "ts": timestamp,
         "sid": format_session_id(session_id_original),
-        "operator_top": determine_actor(event_name, hook_input, session_id_original),
-        "operator": determine_agent_type(event_name, hook_input, session_id_original),
+        "operator_top": determine_operator(event_name, hook_input, session_id_original, level="top"),
+        "operator": determine_operator(event_name, hook_input, session_id_original, level="detailed"),
         "event": event_name,
     }
 
@@ -624,8 +672,13 @@ def extract_event_data(hook_input: Dict[str, Any]) -> Dict[str, Any]:
 
     elif event_name in ["Stop", "SubagentStop"]:
         if hook_input.get("stop_hook_active"):
+            base.update({
+                "phase": "stop",
+                "tool": "hook",
+                "output": {"status": "skipped", "data": "stop_hook_active"}
+            })
             return base
-        
+
         content = ""
         transcript_path = safe_get(hook_input, "transcript_path", default="")
         
@@ -734,7 +787,7 @@ def create_error_post_event(session_id: str, tool_name: str, error: Exception, t
 
 def write_log_line(log_entry: Dict[str, Any]) -> None:
     try:
-        ensure_log_dir()
+        _ensure_log_dir()
 
         rotate_logs_if_needed(LOG_PATH, MAX_LOG_SIZE_MB)
 
@@ -753,6 +806,21 @@ def write_log_line(log_entry: Dict[str, Any]) -> None:
 
 
 def log_ai_output(session_id: str, content: str, analysis_type: str = "general", category: str = "analysis") -> None:
+    """
+    Public API: Log custom AI output or analysis to the event log.
+
+    This function can be called from external tools or scripts to log
+    custom AI-generated content or analysis results.
+
+    Args:
+        session_id: Session identifier
+        content: AI output content to log
+        analysis_type: Type of analysis (default: "general")
+        category: Category of the output (default: "analysis")
+
+    Example:
+        log_ai_output("session123", "Code review complete", "review", "code-quality")
+    """
     try:
         hook_input = {
             "hook_event_name": "AIOutput",
@@ -761,7 +829,7 @@ def log_ai_output(session_id: str, content: str, analysis_type: str = "general",
             "analysis_type": analysis_type,
             "category": category
         }
-        
+
         event_data = extract_event_data(hook_input)
         filtered_data = filter_fields(event_data)
         write_log_line(filtered_data)
@@ -799,6 +867,13 @@ def log_error(error_msg: str) -> None:
 # ============================================================================
 
 def main() -> None:
+    # Validate configuration at startup
+    try:
+        _validate_config()
+    except AssertionError as e:
+        print(f"Configuration error: {e}", file=sys.stderr)
+        sys.exit(1)
+
     is_test_mode = os.getenv("HOOK_TEST") == "1"
     test_result = {"ok": True, "result": None, "logs": []}
 
